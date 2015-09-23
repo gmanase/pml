@@ -1,0 +1,202 @@
+---
+title: "Practical Machine Learning Project"
+author: "George Manase"
+date: "Wednesday, September 16, 2015"
+output: html_document
+---
+
+# Introduction
+This report will aim to follow the structure of prediction study design as introduced in the lecture material. In our case, the question of interest has already been explicitly defined, and the collection of data has been performed. As this is a classification study, we will proceed with accuracy as our error rate of choice.
+
+# Data Cleaning
+We start off by examining the training data as a spreadsheet to see whether anything immediately jumps out as potentially problematic.
+
+```{r, tidy=FALSE}
+# Import both datasets and remove the indexing (first) column of each
+training <- read.csv("pml-training.csv", header = TRUE,
+                     na.strings = c("NA", "", "#DIV/0!"))
+training <- training[-1]
+
+testing <- read.csv("pml-testing.csv", header = TRUE,
+                    na.strings = c("NA", "", "#DIV/0!"))
+testing <- testing[-1]
+
+```
+
+The first thing we notice is that many of the variables are in fact summary measures of existing data, such as means, standard deviations, skewness and kurtosis measures, etc. The information contained in these summary measures is already present in the raw data, so we can safely remove them. The following code removes the unwanted variables:
+
+```{r, tidy=FALSE}
+# Remove all variables whose names begin with any of the following: "kurtosis",
+# "skewness", "max", "min", "var", "avg", "stddev".
+
+# Cycle through the column names of the training dataset and use the strsplit()
+# function to identify what each variable name begins with. If the ith
+# variable name begins with any of the cases listed above, store its column
+# index in a vector of columns to be removed
+
+to.be.removed <- numeric()
+
+# Vector of "unwanted" starts to variable names
+unwanted.starts <- c("kurtosis", "skewness", "max", "min", "var", "avg", "stddev")
+
+for(i in 1:(length(colnames(training)))) {
+  # First part of variable name for column i
+  first.part.name <- unlist(strsplit(colnames(training)[i], split = "_"))[1]
+  
+  if(first.part.name %in% unwanted.starts) {
+    to.be.removed <- c(to.be.removed, i)
+  }
+}
+
+# Remove the variables
+training <- training[,-to.be.removed]
+
+```
+
+Additionally, it seems that many of the "amplitude" variables contain a large number of missing values. We go through the training dataset and tabulate the proportion of entries that are missing for each variable:
+
+```{r, tidy=FALSE}
+missingness.table <- data.frame(Variable = rep(NA, ncol(training)),
+                                Prop_missing = rep(NA, ncol(training)))
+
+for(i in 1:(ncol(training))) {
+  missingness.table[i,1] <- colnames(training)[i]
+  missingness.table[i,2] <- sum(is.na(training[,i]))/nrow(training)
+}
+
+missingness.table
+
+```
+
+We see that all the amplitude variables do in fact have a very high rate of missingness - each variable whose name begins with "amplitude" is missing over 97% of its values. As a result, these variables will not be considered for the model building.
+
+Further, we choose to remove the variables identifying the user, as well as those related to the timestamp. These include **user_name**, **raw_timestamp_part_1**, **raw_timestamp_part_2**, **cvtd_timestamp**, **new_window** and **num_window**. Although some of these variables, particularly the **user_name** variable,  may help us achieve greater accuracy on the test set (since the test set happens to contain the same people), the concern is that such a model may not generalize well for other users. The idea was to use the data from the accelerometers to classify activity performance, so in general using someone's name or date of exercise does not serve the original purpose. As well, the data from the test set is provided to us in individual "chunks" as opposed to a time series, which supports this decision.
+
+```{r, tidy=FALSE}
+# Remove all variables whose names begin with "amplitude". Based on
+# the table of missingness constructed previously, we know the column
+# indices of the variables whose names begin with "amplitude".
+to.be.removed <- c(11, 12, 13, 36, 37, 38, 42, 43, 44, 58, 59, 60)
+
+# Verify that we have selected the correct variables for removal
+colnames(training)[to.be.removed]
+
+training <- training[,-to.be.removed]
+
+
+# Remove the variables "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2",
+# "cvtd_timestamp", "new_window", "num_window" from training set
+training <- training[,-c(which(colnames(training) == "user_name"),
+                         which(colnames(training) == "raw_timestamp_part_1"),
+                         which(colnames(training) == "raw_timestamp_part_2"),
+                         which(colnames(training) == "cvtd_timestamp"),
+                         which(colnames(training) == "new_window"),
+                         which(colnames(training) == "num_window"))]
+
+```
+
+
+We will now further split our training data into a training and a validation set. The validation set will help us to refine our models before applying them to the test set of 20 cases, and it will also help us estimate the out of sample error. We will put 60% of the original training set into a sub-training set, and 40% into a validation set. (Note that the course lectures seem to have reversed the definitions of the test set and the validation set. We use the term "validation set" as defined on page 222 of *The Elements of Statistical Learning* by T. Hastie, R. Tibshirani and J. Friedman).
+
+```{r, tidy=FALSE}
+library(caret)
+set.seed(32343)
+
+inSubTrain <- createDataPartition(y = training$classe, p = 0.6, list = FALSE)
+
+sub.training <- training[inSubTrain,]
+validation <- training[-inSubTrain,]
+
+dim(training)
+dim(validation)
+
+```
+
+
+We would now like to identify so-called "zero" covariates, i.e. those covariates with close to zero variability. We also look for variables that may be linear combinations of one another (using the findLinearCombos() function from the "caret" package). Variables that are linear combinations of one another could be considered redundant and therefore unnecessary. We do not check for correlated variables, nor do we perform PCA or standardization of the predictors. This is because we will be using trees when we construct our prediction model, and as such those pre-processing steps are unlikely to be beneficial.
+
+```{r, tidy=FALSE}
+# Look for covariates with near zero variability
+near.zero.var <- nearZeroVar(sub.training, saveMetrics = TRUE)
+near.zero.var
+
+# Look for covariates that are linear combinations of one another
+sub.training.mat <- as.matrix(sub.training[,-which(colnames(sub.training) == "classe")])
+
+comboInfo <- findLinearCombos(sub.training.mat)
+comboInfo
+
+```
+
+
+There do not seem to be any problems with our candidate covariates based on the above diagnostics. We now proceed to define our candidate prediction functions for use on the 52 selected predictors.
+
+
+# Predictive Algorithms
+We choose to implement both random forests and gradient-boosted trees for this classification problem. As we learned in class, tree ensemble methods allow us to take advantage of the strengths of decision trees (including better performance in nonlinear settings, the use of interactions between variables, and robustness in the face of skewed data) while compensating for the variability that comes from using single trees. These two tree ensemble methods seem to complement each other well. Specifically, Suen et al. (2005) claim that "gradient boosting and bagging applied to regressors can reduce the error due to bias and variance respectively". Thus, our hope is that stacking these two types of models may produce a result that is more accurate than either of the two methods individually.
+
+We train both types of models using 3-fold cross-validation on the sub-training data. We do this by making use of the "trControl" argument in the train() function. We would have liked to use 10-fold cross validation as is the default, but unfortunately this was quite computationally expensive for the machine on which this program was compiled.
+
+```{r,tidy=FALSE}
+library(randomForest)
+library(gbm)
+library(e1071)
+
+
+set.seed(32343)
+rf.fit <- train(classe ~ ., data = sub.training, method = "rf",
+                trControl = trainControl(method = "cv", number = 3))
+
+set.seed(12457)
+boosted.fit <- train(classe ~ ., data = sub.training, method = "gbm",
+                     trControl = trainControl(method = "cv", number = 3))
+
+# Predict on validation set
+pred.rf <- predict(rf.fit, validation)
+pred.boosted <- predict(boosted.fit, validation)
+
+# Fit a model that relates the outcome to the two predictions
+pred.DF <- data.frame(pred.rf, pred.boosted, Class = validation$classe)
+
+set.seed(85467)
+comb.mod.fit <- train(Class ~ ., method = "rf", data = pred.DF,
+                      trControl = trainControl(method = "cv", number = 3))
+comb.pred <- predict(comb.mod.fit, pred.DF)
+
+# Accuracy for the individual models
+confusionMatrix(pred.rf, validation$classe)
+confusionMatrix(pred.boosted, validation$classe)
+
+# Accuracy for the stacked model
+confusionMatrix(comb.pred, validation$classe)
+
+```
+
+We see that the combined model appears to be fitting just as well as the random forest on its own, but slightly better than the gradient-boosted trees. Therefore, we decide to use the random forest model on the testing set.
+
+
+# Estimated Out of Sample Error
+Through the use of the above cross-validation results on the random forest model, we are able to estimate what the out of sample error will be based on the error reported on the validation set. We compute error as $1 - \text{accuracy}$, and so based on our random forest model the error is estimated to be $1 - 0.9935 = 0.0065$.
+
+
+# Prediction of 20 Test Cases
+We now use the random forest algorithm to predict on the test set.
+
+```{r, tidy=FALSE}
+pred.rf.test <- predict(rf.fit, testing)
+pred.rf.test
+
+# We now run the function supplied by the instructors to create
+# text files containing our predictions (one prediction per file)
+pml_write_files = function(x) {
+  n = length(x)
+  for(i in 1:n) {
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+answers <- as.character(pred.rf.test)
+pml_write_files(answers)
+
+```
